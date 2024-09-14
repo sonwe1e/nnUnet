@@ -1556,7 +1556,6 @@ class WindowAttention(nn.Module):
 
 
 class SwinTransformerBlock(nn.Module):
-
     def __init__(
         self,
         dim,
@@ -2022,7 +2021,6 @@ class PatchEmbed(nn.Module):
 
 
 class Encoder(nn.Module):
-
     def __init__(
         self,
         pretrain_img_size=224,
@@ -2224,7 +2222,6 @@ class final_patch_expanding(nn.Module):
 
 
 class nnFormer(SegmentationNetwork):
-
     def __init__(
         self,
         crop_size=[128, 128, 128],
@@ -2245,9 +2242,7 @@ class nnFormer(SegmentationNetwork):
         self.do_ds = deep_supervision
         self.num_classes = num_classes
         self.conv_op = conv_op
-
         self.upscale_logits_ops = []
-
         self.upscale_logits_ops.append(lambda x: x)
 
         embed_dim = embedding_dim
@@ -2275,7 +2270,6 @@ class nnFormer(SegmentationNetwork):
 
         self.final = []
         if self.do_ds:
-
             for i in range(len(depths) - 1):
                 self.final.append(
                     final_patch_expanding(

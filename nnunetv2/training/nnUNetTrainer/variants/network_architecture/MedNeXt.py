@@ -758,7 +758,6 @@ def create_mednext_v1(
 
 
 if __name__ == "__main__":
-
     network = MedNeXt(
         in_channels=1,
         n_channels=32,

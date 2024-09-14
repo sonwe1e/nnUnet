@@ -16,6 +16,11 @@ from typing import Union, Tuple, List
 from nnunetv2.training.nnUNetTrainer.variants.network_architecture.BresstCancerNet import (
     BresstCancerNet,
 )
+from nnunetv2.training.nnUNetTrainer.variants.network_architecture.UXNet import UXNET
+from nnunetv2.training.nnUNetTrainer.variants.network_architecture.MedNeXt import (
+    MedNeXt,
+)
+from monai.networks.nets import UNETR, SwinUNETR, AttentionUnet
 
 
 class nnUNetTrainerBreast(nnUNetTrainer):
@@ -38,7 +43,7 @@ class nnUNetTrainerBreast(nnUNetTrainer):
         self.batch_size = 2
         self.initial_lr = 4e-4
         self.weight_decay = 5e-2
-        self.enable_deep_supervision = True
+        self.enable_deep_supervision = True  # True
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(
@@ -139,6 +144,37 @@ class nnUNetTrainerBreast(nnUNetTrainer):
             num_output_channels,
             deep_supervision=enable_deep_supervision,
         )
+        # model = UNETR(num_input_channels, num_output_channels, img_size=(144, 144, 144))
+        # model = SwinUNETR(
+        #     img_size=(128, 128, 128),
+        #     in_channels=num_input_channels,
+        #     out_channels=num_output_channels,
+        #     use_v2=True,
+        # )
+        # model = AttentionUnet(
+        #     3,
+        #     in_channels=num_input_channels,
+        #     out_channels=num_output_channels,
+        #     channels=[32, 64, 128, 256, 320],
+        #     strides=[2, 2, 2, 2],
+        # )
+        # model = MedNeXt(
+        #     in_channels=num_input_channels,
+        #     n_channels=32,
+        #     n_classes=num_output_channels,
+        #     exp_r=[2, 3, 4, 4, 4, 4, 4, 3, 2],
+        #     kernel_size=3,
+        #     deep_supervision=False,
+        #     do_res=True,
+        #     do_res_up_down=True,
+        #     block_counts=[3, 4, 4, 4, 4, 4, 4, 4, 3],
+        #     checkpoint_style="outside_block",
+        # )
+        # model = UXNET(
+        #     num_input_channels,
+        #     num_output_channels,
+        #     # deep_supervision=enable_deep_supervision,
+        # )
         return model
 
     def set_deep_supervision_enabled(self, enabled: bool):

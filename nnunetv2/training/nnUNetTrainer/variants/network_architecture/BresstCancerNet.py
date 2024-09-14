@@ -3,6 +3,67 @@ import torch.nn as nn
 from torchinfo import summary
 import torch.nn.functional as F
 
+class BasicConv(nn.Module):
+    def __init__(self, in_channels, kernel_size=1, stride=1, padding=0, groups=1):
+        super(BasicConv, self).__init__()
+        self.conv = nn.Conv3d(in_channels, in_channels, kernel_size, stride, padding, groups=groups)
+        self.bn = nn.InstanceNorm3d(in_channels)
+        self.act = nn.LeakyReLU(inplace=True)
+
+    def forward(self, x):
+        x = self.act(self.bn(self.conv(x))) +  x
+        return x
+
+class GatingNetwork(nn.Module):
+    """Gating Network to select expert weights"""
+    def __init__(self, in_features, num_experts):
+        super(GatingNetwork, self).__init__()
+        self.fc = nn.Linear(in_features, num_experts)
+
+    def forward(self, x):
+        # Assume x has shape (batch_size, in_features)
+        gate_logits = self.fc(x)
+        gate_weights = F.softmax(gate_logits, dim=1)  # Apply softmax to get expert weights
+        return gate_weights
+
+
+class MoEModule(nn.Module):
+    """Mixture of Experts Module"""
+    def __init__(self, in_channels, num_experts=4):
+        super(MoEModule, self).__init__()
+        self.experts = nn.ModuleList([
+            BasicConv(in_channels, kernel_size=3, padding=1),
+            nn.Sequential(
+                BasicConv(in_channels, kernel_size=1, padding=0),
+                BasicConv(in_channels, kernel_size=3, padding=1, groups=in_channels),
+                BasicConv(in_channels, kernel_size=5, padding=2, groups=in_channels)
+            ),
+            BasicConv(in_channels, kernel_size=7, padding=3, groups=in_channels),
+            nn.Sequential(
+                BasicConv(in_channels, kernel_size=5, padding=2, groups=in_channels),
+                BasicConv(in_channels, kernel_size=3, padding=1, groups=in_channels),
+                BasicConv(in_channels, kernel_size=1, padding=0)
+            ),
+        ])
+        self.gating_network = GatingNetwork(in_channels, num_experts)  # Gating network to control experts
+
+    def forward(self, x):
+        # Global average pooling to get a global context for gating network input
+        batch_size, in_channels, h, w, d = x.size()
+        global_context = F.adaptive_avg_pool3d(x, (1, 1, 1)).view(batch_size, in_channels)  # (batch_size, in_channels)
+
+        # Get gating weights for each expert
+        gate_weights = self.gating_network(global_context)  # (batch_size, num_experts)
+
+        # Collect expert outputs
+        expert_outputs = torch.stack([expert(x) for expert in self.experts], dim=1)  # (batch_size, num_experts, out_channels, h, w)
+
+        # Weighted sum of expert outputs
+        gate_weights = gate_weights.view(batch_size, len(self.experts), 1, 1, 1, 1)  # (batch_size, num_experts, 1, 1, 1)
+        output = torch.sum(expert_outputs * gate_weights, dim=1)  # Weighted sum along the expert dimension
+
+        return output
+
 
 class SKFusionv2(nn.Module):
     def __init__(self, dim, height=2, reduction=4, kernel_size=3):
@@ -34,14 +95,14 @@ class SKFusionv2(nn.Module):
 
 
 class MSCHeadv5(nn.Module):
-    def __init__(self, in_channels, out_channels):
+    def __init__(self, in_channels, out_channels, larger_kenel=11):
         super(MSCHeadv5, self).__init__()
         self.in_channels = in_channels
         self.head1 = nn.Conv3d(in_channels, in_channels, 1, 1, 0)
-        self.head2 = nn.Conv3d(in_channels, in_channels, (31, 1, 1), 1, (15, 0, 0))
-        self.head3 = nn.Conv3d(in_channels, in_channels, (1, 31, 1), 1, (0, 15, 0))
-        self.head4 = nn.Conv3d(in_channels, in_channels, (1, 1, 31), 1, (0, 0, 15))
-        self.head5 = nn.Conv3d(in_channels, in_channels, 31, 1, 15, groups=in_channels)
+        self.head2 = nn.Conv3d(in_channels, in_channels, (larger_kenel, 1, 1), 1, (larger_kenel // 2, 0, 0))
+        self.head3 = nn.Conv3d(in_channels, in_channels, (1, larger_kenel, 1), 1, (0, larger_kenel // 2, 0))
+        self.head4 = nn.Conv3d(in_channels, in_channels, (1, 1, larger_kenel), 1, (0, 0, larger_kenel // 2))
+        self.head5 = nn.Conv3d(in_channels, in_channels, larger_kenel, 1, larger_kenel // 2, groups=in_channels)
         self.sk = SKFusionv2(in_channels, height=5, kernel_size=9)
         self.out = nn.Conv3d(in_channels * 6, out_channels, 3, 1, 1)
 
@@ -79,7 +140,7 @@ class DefineConv(nn.Module):
         out_channels,
         kernel_size=[1, 3, 3, 1],
         expand_rate=2,
-        eca=False,
+        moe=False,
     ):
         super().__init__()
         expand_rate = expand_rate
@@ -124,7 +185,7 @@ class DefineConv(nn.Module):
                 )
         self.residual = in_channels == out_channels
         self.act = nn.LeakyReLU(inplace=True)
-        self.eca = ECABlock(out_channels) if eca else None
+        self.moe = MoEModule(out_channels) if moe else nn.Identity()
 
         for m in self.modules():
             if isinstance(m, nn.Conv3d):
@@ -138,8 +199,7 @@ class DefineConv(nn.Module):
             if _ == len(self.conv_list) - 1:
                 x += res if self.residual else x
             x = self.act(x)
-        if self.eca:
-            x = self.eca(x)
+        x = self.moe(x)
         return x
 
 
@@ -192,7 +252,6 @@ class Up(nn.Module):
         self.extractor = nn.ModuleList(
             [conv(out_channels, out_channels, **kwargs) for _ in range(num_conv)]
         )
-        # self.sk = SKFusionv2(high_channels, kernel_size=9)
 
     def forward(self, x_low, x_high):
         x_low = self.up(x_low)
@@ -200,7 +259,6 @@ class Up(nn.Module):
             x = torch.cat([x_high, x_low], dim=1)
         else:
             x = x_high + x_low
-            # x = self.sk([x_high, x_low])
         x = self.upsample(x)
         for extractor in self.extractor:
             x = extractor(x)
@@ -226,7 +284,7 @@ class BresstCancerNet(nn.Module):
         encoder_channels=[32, 64, 128, 256, 320],
         conv=DefineConv,
         deep_supervision=False,
-        strides=[(2, 2, 2), (2, 2, 2), (2, 2, 2), (2, 2, 2), (2, 2, 2)],
+        strides=[(2, 2, 2), (2, 2, 2), (2, 2, 2), (1, 2, 2)],
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -234,7 +292,7 @@ class BresstCancerNet(nn.Module):
         self.depth = depth
         self.deep_supervision = deep_supervision
         assert len(encoder_channels) == depth + 1, "len(encoder_channels) != depth + 1"
-        assert len(strides) == depth + 1, "len(strides) != depth"
+        assert len(strides) == depth, "len(strides) != depth"
 
         self.encoders = nn.ModuleList()  # 使用 ModuleList 存储编码器层
         self.encoders.append(nn.Conv3d(in_channels, encoder_channels[0], 3, 1, 1))
@@ -251,6 +309,7 @@ class BresstCancerNet(nn.Module):
                     stride=strides[i],
                     kernel_size=[1, 3, 3, 1],
                     expand_rate=2,
+                    moe=False
                 )
             )
 
@@ -264,15 +323,16 @@ class BresstCancerNet(nn.Module):
                     conv=conv,
                     num_conv=1,
                     stride=strides[self.depth - i - 1],
-                    fusion_mode="add",
+                    fusion_mode="cat",
                     kernel_size=[1, 3, 3, 1],
                     expand_rate=2,
+                    moe=False if i < self.depth - 1 else False
                 )
             )
         self.out = nn.ModuleList(
             [Out(encoder_channels[depth - i - 1], n_classes) for i in range(depth)]
         )
-        self.out[-1] = MSCHeadv5(encoder_channels[0], n_classes)
+        # self.out[-1] = MSCHeadv5(encoder_channels[0], n_classes, 31)
 
     def forward(self, x):
         encoder_features = []  # 存储编码器输出
@@ -298,9 +358,4 @@ class BresstCancerNet(nn.Module):
 
 if __name__ == "__main__":
     model = BresstCancerNet(1, 4)
-    print(
-        summary(model, input_size=(2, 1, 64, 64, 64), device="cpu", depth=5),
-    )
-    # x = torch.randn(2, 1, 64, 64, 64)
-    # y = model(x)
-    # print(y.shape)
+    summary(model, input_size=(2, 1, 48, 192, 192), device="cuda:3", depth=5)

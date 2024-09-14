@@ -135,7 +135,7 @@ class nnUNetTrainer(object):
         # OK OK I am guilty. But I tried.
         # https://www.osnews.com/images/comics/wtfm.jpg
         # https://i.pinimg.com/originals/26/b2/50/26b250a738ea4abc7a5af4d42ad93af0.jpg
-        wandb.init(project="nnUnetv2", name=exp_name, tags=["AortaSeg"])
+        wandb.init(project="nnUnetv2", name=exp_name)
 
         self.is_ddp = dist.is_available() and dist.is_initialized()
         self.local_rank = 0 if not self.is_ddp else dist.get_rank()
@@ -216,7 +216,7 @@ class nnUNetTrainer(object):
         self.oversample_foreground_percent = 0.33
         self.num_iterations_per_epoch = 250
         self.num_val_iterations_per_epoch = 50
-        self.num_epochs = 1000
+        self.num_epochs = 500 # 1000
         self.current_epoch = 0
         self.enable_deep_supervision = True
 
