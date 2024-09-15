@@ -117,20 +117,57 @@ class MSCHeadv5(nn.Module):
         x = self.out(x)
         return x
 
-
-class ECABlock(nn.Module):
-    def __init__(self, in_channels, kernel_size=9):
-        super(ECABlock, self).__init__()
-        self.global_avg_pool = nn.AdaptiveAvgPool3d(1)
-        self.conv = nn.Conv1d(1, 1, kernel_size, 1, (kernel_size - 1) // 2, bias=False)
+# Attention Mechanisms
+class ChannelAttention(nn.Module):
+    def __init__(self, in_channels, ratio=8):
+        super(ChannelAttention, self).__init__()
+        self.shared_mlp = nn.Sequential(
+            nn.AdaptiveAvgPool3d(1),
+            nn.Conv3d(in_channels, in_channels // ratio, 1, bias=False),
+            nn.ReLU(),
+            nn.Conv3d(in_channels // ratio, in_channels, 1, bias=False)
+        )
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        b, c, _, _, _ = x.size()
-        y = self.global_avg_pool(x).view(b, c, 1)  # (b, c, 1)
-        y = self.conv(y.transpose(-1, -2)).transpose(-1, -2)
-        y = self.sigmoid(y)
-        return x * y.unsqueeze(-1).unsqueeze(-1)
+        out = self.shared_mlp(x)
+        return self.sigmoid(out) * x
+
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=7):
+        super(SpatialAttention, self).__init__()
+        self.conv = nn.Conv3d(2, 1, kernel_size, padding=(kernel_size-1)//2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        x_cat = torch.cat([avg_out, max_out], dim=1)
+        out = self.conv(x_cat)
+        return self.sigmoid(out) * x
+
+# Small Object Enhancement Module (SOEM)
+class SOEM(nn.Module):
+    def __init__(self, in_channels):
+        super(SOEM, self).__init__()
+        self.dilated_conv1 = nn.Conv3d(in_channels, in_channels, kernel_size=3, padding=1, dilation=1)
+        self.dilated_conv2 = nn.Conv3d(in_channels, in_channels, kernel_size=3, padding=2, dilation=2)
+        self.dilated_conv3 = nn.Conv3d(in_channels, in_channels, kernel_size=3, padding=3, dilation=3)
+        self.conv = DefineConv(in_channels, in_channels, kernel_size=[1, 3, 3, 1], expand_rate=2, moe=False, soem=False)
+        self.channel_attention = ChannelAttention(in_channels)
+        self.spatial_attention = SpatialAttention()
+
+    def forward(self, x):
+        res = x
+        x1 = self.dilated_conv1(x)
+        x2 = self.dilated_conv2(x)
+        x3 = self.dilated_conv3(x)
+        x_concat = x1 + x2 + x3 + res
+        x_concat = self.conv(x_concat)
+        x_ca = self.channel_attention(x_concat)
+        x_sa = self.spatial_attention(x_ca)
+        x_sa = x_sa + x_concat
+        return x_sa
 
 
 class DefineConv(nn.Module):
@@ -141,6 +178,7 @@ class DefineConv(nn.Module):
         kernel_size=[1, 3, 3, 1],
         expand_rate=2,
         moe=False,
+        soem=False,
     ):
         super().__init__()
         expand_rate = expand_rate
@@ -185,12 +223,14 @@ class DefineConv(nn.Module):
                 )
         self.residual = in_channels == out_channels
         self.act = nn.LeakyReLU(inplace=True)
-        self.moe = MoEModule(out_channels) if moe else nn.Identity()
 
         for m in self.modules():
             if isinstance(m, nn.Conv3d):
                 nn.init.trunc_normal_(m.weight, std=0.06)
                 nn.init.constant_(m.bias, 0)
+
+        self.moe = MoEModule(out_channels) if moe else nn.Identity()
+        self.soem = SOEM(out_channels) if soem else nn.Identity()
 
     def forward(self, x):
         res = x
@@ -200,6 +240,7 @@ class DefineConv(nn.Module):
                 x += res if self.residual else x
             x = self.act(x)
         x = self.moe(x)
+        x = self.soem(x)
         return x
 
 
@@ -309,7 +350,8 @@ class BresstCancerNet(nn.Module):
                     stride=strides[i],
                     kernel_size=[1, 3, 3, 1],
                     expand_rate=2,
-                    moe=False
+                    moe=True,
+                    soem=False
                 )
             )
 
@@ -326,7 +368,8 @@ class BresstCancerNet(nn.Module):
                     fusion_mode="cat",
                     kernel_size=[1, 3, 3, 1],
                     expand_rate=2,
-                    moe=False if i < self.depth - 1 else False
+                    moe=True if i < self.depth - 1 else False,
+                    soem=False 
                 )
             )
         self.out = nn.ModuleList(
@@ -358,4 +401,4 @@ class BresstCancerNet(nn.Module):
 
 if __name__ == "__main__":
     model = BresstCancerNet(1, 4)
-    summary(model, input_size=(2, 1, 48, 192, 192), device="cuda:3", depth=5)
+    summary(model, input_size=(2, 1, 48, 192, 192), device="cuda:5", depth=5)
