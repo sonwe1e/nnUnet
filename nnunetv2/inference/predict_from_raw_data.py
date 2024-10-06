@@ -436,7 +436,6 @@ class nnUNetPredictor(object):
         truncated_ofname: Union[str, List[str], None],
         num_processes: int = 3,
     ):
-
         list_of_images = (
             [image_or_list_of_images]
             if not isinstance(image_or_list_of_images, list)
@@ -682,7 +681,6 @@ class nnUNetPredictor(object):
         prediction = None
 
         for params in self.list_of_parameters:
-
             # messing with state dict names...
             if not isinstance(self.network, OptimizedModule):
                 self.network.load_state_dict(params)
@@ -1076,11 +1074,14 @@ def predict_entry_point_modelfolder():
     if not isdir(args.o):
         maybe_mkdir_p(args.o)
 
-    assert args.device in [
-        "cpu",
-        "cuda",
-        "mps",
-    ], f"-device must be either cpu, mps or cuda. Other devices are not tested/supported. Got: {args.device}."
+    assert (
+        args.device
+        in [
+            "cpu",
+            "cuda",
+            "mps",
+        ]
+    ), f"-device must be either cpu, mps or cuda. Other devices are not tested/supported. Got: {args.device}."
     if args.device == "cpu":
         # let's allow torch to use hella threads
         import multiprocessing
@@ -1307,11 +1308,14 @@ def predict_entry_point():
         args.part_id < args.num_parts
     ), "Do you even read the documentation? See nnUNetv2_predict -h."
 
-    assert args.device in [
-        "cpu",
-        "cuda",
-        "mps",
-    ], f"-device must be either cpu, mps or cuda. Other devices are not tested/supported. Got: {args.device}."
+    assert (
+        args.device
+        in [
+            "cpu",
+            "cuda",
+            "mps",
+        ]
+    ), f"-device must be either cpu, mps or cuda. Other devices are not tested/supported. Got: {args.device}."
     if args.device == "cpu":
         # let's allow torch to use hella threads
         import multiprocessing

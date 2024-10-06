@@ -1,26 +1,23 @@
 import torch
 import torch.nn as nn
 from torchinfo import summary
-import torch.nn.functional as F
 from torch.amp import autocast
 from mamba_ssm import Mamba
-from timm.models.layers import DropPath
+import torch.nn.functional as F
+from einops import rearrange
 
 
-class EffectiveSEModule(nn.Module):
-    def __init__(self, channels, add_maxpool=False):
-        super(EffectiveSEModule, self).__init__()
-        self.add_maxpool = add_maxpool
-        self.fc = nn.Conv3d(channels, channels, kernel_size=1, padding=0)
-        self.gate = nn.Sigmoid()
+class LayerNormBatchFirst(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
 
     def forward(self, x):
-        x_se = x.mean((2, 3, 4), keepdim=True)
-        if self.add_maxpool:
-            # experimental codepath, may remove or change
-            x_se = 0.5 * x_se + 0.5 * x.amax((2, 3, 4), keepdim=True)
-        x_se = self.fc(x_se)
-        return x * self.gate(x_se)
+        ## x.shape = (B, C, D, H, W) ##
+        x = x.permute(0, 2, 3, 4, 1)
+        x = self.norm(x)
+        x = x.permute(0, 4, 1, 2, 3)
+        return x
 
 
 class MambaLayer(nn.Module):
@@ -78,100 +75,30 @@ class SKFusionv2(nn.Module):
         return out
 
 
-class MSCHead(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_list=[5, 7, 9]):
-        super(MSCHead, self).__init__()
-        self.in_channels = in_channels
-        self.head1 = nn.Conv3d(in_channels, in_channels // 2, 1, 1, 0)
-        self.head2 = nn.Conv3d(
-            in_channels,
-            in_channels,
-            kernel_list[0],
-            1,
-            kernel_list[0],
-            groups=in_channels,
-        )
-        self.head3 = nn.Conv3d(
-            in_channels,
-            in_channels,
-            kernel_list[1],
-            1,
-            kernel_list[1],
-            groups=in_channels,
-        )
-        self.head4 = nn.Conv3d(
-            in_channels,
-            in_channels,
-            kernel_list[2],
-            1,
-            kernel_list[2],
-            groups=in_channels,
-        )
-        self.sk = SKFusionv2(in_channels, height=4, kernel_size=11)
-        self.out = nn.Conv3d(in_channels * 5, out_channels, 1, 1, 0)
-
-    def forward(self, x):
-        x1 = self.head1(x)
-        x2 = self.head2(x)
-        x3 = self.head3(x)
-        x4 = self.head4(x)
-        x = self.sk([x1, x2, x3, x4])
-        x = torch.cat([x1, x2, x3, x4, x], dim=1)
-        x = self.out(x)
-        return x
-
-
 class ConvNeXtConv(nn.Module):
-    def __init__(
-        self,
-        in_channels,
-        out_channels,
-        expand_rate=4,
-        drop_path_rate=0.0,
-    ):
-        super().__init__()
-        self.drop_path_rate = drop_path_rate
-        self.conv_list = nn.ModuleList()
-
-        self.conv_list.append(
-            nn.Sequential(
-                nn.Conv3d(in_channels, in_channels, 7, 1, 3, groups=in_channels),
-                nn.InstanceNorm3d(in_channels, affine=True),
-            )
+    def __init__(self, in_channels, out_channels, kernel_size=3, expand_rate=4):
+        super(ConvNeXtConv, self).__init__()
+        self.conv = nn.Conv3d(
+            in_channels,
+            in_channels,
+            kernel_size,
+            1,
+            kernel_size // 2,
+            groups=in_channels,
         )
-        self.conv_list.append(
-            nn.Sequential(
-                nn.Conv3d(in_channels, in_channels * expand_rate, 1, 1, 0),
-                nn.InstanceNorm3d(in_channels * expand_rate, affine=True),
-            )
-        )
-        self.conv_list.append(
-            nn.Sequential(
-                nn.Conv3d(in_channels * expand_rate, out_channels, 1, 1, 0),
-                nn.InstanceNorm3d(out_channels, affine=True),
-            )
-        )
-        self.residual = in_channels == out_channels
+        self.ln = nn.LayerNorm(in_channels)
         self.act = nn.LeakyReLU(inplace=True)
-
-        for m in self.modules():
-            if isinstance(m, nn.Conv3d):
-                nn.init.trunc_normal_(m.weight, std=0.06)
-                nn.init.constant_(m.bias, 0)
-
-        if self.drop_path_rate > 0:
-            self.drop_path = DropPath(drop_path_rate)
+        self.conv1 = nn.Conv3d(in_channels, in_channels * expand_rate, 1, 1, 0)
+        self.conv2 = nn.Conv3d(in_channels * expand_rate, out_channels, 1, 1, 0)
 
     def forward(self, x):
-        res = x
-        for _, conv in enumerate(self.conv_list):
-            x = conv(x)
-            if _ == len(self.conv_list) - 1:
-                x += res if self.residual else x
-            x = self.act(x)
-
-        if self.drop_path_rate > 0 and self.training:
-            x = self.drop_path(x)
+        x = self.conv(x)
+        x = x.permute(0, 2, 3, 4, 1)
+        x = self.ln(x)
+        x = x.permute(0, 4, 1, 2, 3)
+        x = self.conv1(x)
+        x = self.act(x)
+        x = self.conv2(x)
         return x
 
 
@@ -180,51 +107,42 @@ class ResNeXtConv(nn.Module):
         self,
         in_channels,
         out_channels,
-        kernel_size=[1, 3, 1],
+        stride=1,
         expand_rate=2,
-        drop_path_rate=0.0,
     ):
         super().__init__()
-        self.drop_path_rate = drop_path_rate
+        self.stride = stride
         self.conv_list = nn.ModuleList()
-        for _, kernel in enumerate(kernel_size):
-            if _ == 0:
-                self.conv_list.append(
-                    nn.Sequential(
-                        nn.Conv3d(
-                            in_channels,
-                            out_channels * expand_rate,
-                            kernel,
-                            padding=kernel // 2,
-                        ),
-                        nn.InstanceNorm3d(out_channels * expand_rate, affine=True),
-                    )
-                )
-            elif _ == len(kernel_size) - 1:
-                self.conv_list.append(
-                    nn.Sequential(
-                        nn.Conv3d(
-                            out_channels * expand_rate,
-                            out_channels,
-                            kernel,
-                            padding=kernel // 2,
-                        ),
-                        nn.InstanceNorm3d(out_channels, affine=True),
-                    )
-                )
-            else:
-                self.conv_list.append(
-                    nn.Sequential(
-                        nn.Conv3d(
-                            out_channels * expand_rate,
-                            out_channels * expand_rate,
-                            kernel,
-                            padding=kernel // 2,
-                            groups=out_channels * expand_rate,
-                        ),
-                        nn.InstanceNorm3d(out_channels * expand_rate, affine=True),
-                    )
-                )
+
+        self.conv_list.append(
+            nn.Sequential(
+                nn.Conv3d(in_channels, in_channels * expand_rate, 1, 1, 0),
+                nn.InstanceNorm3d(in_channels * expand_rate, affine=True),
+                nn.LeakyReLU(inplace=True),
+            )
+        )
+        self.conv_list.append(
+            nn.Sequential(
+                nn.Conv3d(
+                    in_channels * expand_rate,
+                    in_channels * expand_rate,
+                    3,
+                    stride,
+                    1,
+                    groups=in_channels,
+                ),
+                nn.InstanceNorm3d(in_channels * expand_rate, affine=True),
+                nn.LeakyReLU(inplace=True),
+            )
+        )
+        self.conv_list.append(
+            nn.Sequential(
+                nn.Conv3d(in_channels * expand_rate, out_channels, 1, 1, 0),
+                nn.InstanceNorm3d(out_channels, affine=True),
+                nn.LeakyReLU(inplace=True),
+            )
+        )
+
         self.residual = in_channels == out_channels
         self.act = nn.LeakyReLU(inplace=True)
 
@@ -233,19 +151,12 @@ class ResNeXtConv(nn.Module):
                 nn.init.trunc_normal_(m.weight, std=0.06)
                 nn.init.constant_(m.bias, 0)
 
-        if self.drop_path_rate > 0:
-            self.drop_path = DropPath(drop_path_rate)
-
     def forward(self, x):
         res = x
-        for _, conv in enumerate(self.conv_list):
-            x = conv(x)
-            if _ == len(self.conv_list) - 1:
-                x += res if self.residual else x
-            x = self.act(x)
-
-        if self.drop_path_rate > 0 and self.training:
-            x = self.drop_path(x)
+        x = self.conv_list[0](x)
+        x = self.conv_list[1](x)
+        x = self.conv_list[2](x)
+        x = x + res if self.residual and self.stride == 1 else x
         return x
 
 
@@ -254,18 +165,20 @@ class DenseConv(nn.Module):
         self,
         in_channels,
         out_channels,
+        stride=1,
         expand_rate=4,
+        dropout_rate=0.0,
         drop_path_rate=0.0,
     ):
         super().__init__()
-        self.drop_path_rate = drop_path_rate
         self.conv_list = nn.ModuleList()
 
         self.conv_list.append(
             nn.Sequential(
-                nn.Conv3d(in_channels, in_channels, 3, 1, 1, groups=in_channels),
+                nn.Conv3d(in_channels, in_channels, 3, stride, 1, groups=in_channels),
                 nn.InstanceNorm3d(in_channels, affine=True),
-                nn.LeakyReLU(inplace=True),
+                # LayerNormBatchFirst(in_channels),
+                # nn.LeakyReLU(inplace=True),
             )
         )
         self.conv_list.append(
@@ -273,62 +186,44 @@ class DenseConv(nn.Module):
                 nn.Conv3d(
                     in_channels + in_channels, in_channels * expand_rate, 1, 1, 0
                 ),
-                nn.InstanceNorm3d(in_channels * expand_rate, affine=True),
-                nn.LeakyReLU(inplace=True),
+                # nn.InstanceNorm3d(in_channels * expand_rate, affine=True),
+                # nn.LeakyReLU(inplace=True),
+                nn.GELU(),
             )
         )
+        temp_in_channels = in_channels + in_channels + in_channels * expand_rate
         self.conv_list.append(
             nn.Sequential(
-                nn.Conv3d(
-                    in_channels + in_channels + in_channels * expand_rate,
-                    out_channels,
-                    1,
-                    1,
-                    0,
-                ),
-                nn.InstanceNorm3d(out_channels, affine=True),
-                nn.LeakyReLU(inplace=True),
+                nn.Conv3d(temp_in_channels, out_channels, 1, 1, 0),
+                # nn.InstanceNorm3d(out_channels, affine=True),
+                # nn.LeakyReLU(inplace=True),
             )
         )
-        self.conv_list.append(
-            nn.Sequential(
-                nn.Conv3d(
-                    in_channels
-                    + in_channels
-                    + in_channels * expand_rate
-                    + out_channels,
-                    out_channels,
-                    1,
-                    1,
-                    0,
-                ),
-                nn.InstanceNorm3d(out_channels, affine=True),
-                nn.LeakyReLU(inplace=True),
-            )
-        )
+        self.dp_1 = nn.Dropout(dropout_rate)
+        self.dp_2 = nn.Dropout(dropout_rate * 2)
         self.residual = in_channels == out_channels
+        self.drop_path = (
+            True if torch.rand(1) < drop_path_rate and self.training else False
+        )
 
         for m in self.modules():
             if isinstance(m, nn.Conv3d):
                 nn.init.trunc_normal_(m.weight, std=0.06)
                 nn.init.constant_(m.bias, 0)
 
-        if self.drop_path_rate > 0:
-            self.drop_path = DropPath(drop_path_rate)
-
     def forward(self, x):
         res = x
+        if self.drop_path and self.residual:
+            return res
         x1 = self.conv_list[0](x)
+        x1 = self.dp_1(x1)
         x2 = self.conv_list[1](torch.cat([x, x1], dim=1))
-        x3 = self.conv_list[2](torch.cat([x, x1, x2], dim=1))
+        x2 = self.dp_2(x2)
         x = (
-            self.conv_list[3](torch.cat([x, x1, x2, x3], dim=1)) + res
+            self.conv_list[2](torch.cat([x, x1, x2], dim=1)) + res
             if self.residual
-            else self.conv_list[3](torch.cat([x, x1, x2, x3], dim=1))
+            else self.conv_list[2](torch.cat([x, x1, x2], dim=1))
         )
-
-        if self.drop_path_rate > 0 and self.training:
-            x = self.drop_path(x)
         return x
 
 
@@ -344,7 +239,8 @@ class Down(nn.Module):
     ):
         super().__init__()
         assert num_conv >= 1, "num_conv must be greater than or equal to 1"
-        self.downsample = nn.AvgPool3d(stride)
+        self.downsample_avg = nn.AvgPool3d(stride)
+        self.downsample_resnext = ResNeXtConv(in_channels, in_channels, stride=stride)
         self.extractor = nn.ModuleList(
             [
                 (
@@ -357,7 +253,7 @@ class Down(nn.Module):
         )
 
     def forward(self, x):
-        x = self.downsample(x)
+        x = self.downsample_avg(x) + self.downsample_resnext(x)
         for extractor in self.extractor:
             x = extractor(x)
         return x
@@ -378,7 +274,9 @@ class Up(nn.Module):
         super().__init__()
 
         self.fusion_mode = fusion_mode
-        self.up = nn.ConvTranspose3d(low_channels, high_channels, stride, stride)
+        self.up_transpose = nn.ConvTranspose3d(
+            low_channels, high_channels, stride, stride
+        )
         in_channels = 2 * high_channels if fusion_mode == "cat" else high_channels
         self.extractor = nn.ModuleList(
             [
@@ -392,7 +290,7 @@ class Up(nn.Module):
         )
 
     def forward(self, x_low, x_high):
-        x_low = self.up(x_low)
+        x_low = self.up_transpose(x_low)  # + self.up_interploation(x_low)
         x = (
             torch.cat([x_high, x_low], dim=1)
             if self.fusion_mode == "cat"
@@ -404,10 +302,10 @@ class Up(nn.Module):
 
 
 class Out(nn.Module):
-    def __init__(self, in_channels, num_classes, dropout_rate=0.4):
+    def __init__(self, in_channels, num_classes, dropout_rate=0.1):
         super().__init__()
         self.dp = nn.Dropout(dropout_rate)
-        self.conv1 = nn.Conv3d(in_channels, num_classes, 1)
+        self.conv1 = nn.Conv3d(in_channels, num_classes, 1, 1, 0)
 
     def forward(self, x):
         x = self.dp(x)
@@ -422,15 +320,16 @@ class BresstCancerNet(nn.Module):
         n_classes,
         depth=4,
         conv=DenseConv,
-        channels=[32, 64, 128, 256, 320],
-        encoder_num_conv=[1, 2, 4, 3],
-        decoder_num_conv=[1, 2, 4, 3],
-        encoder_expand_rate=[1, 2, 2, 3],
-        decoder_expand_rate=[1, 2, 2, 3],
-        strides=[(2, 2, 2), (2, 2, 2), (2, 2, 2), (1, 2, 2)],
-        drop_path_rate_list=[0.0, 0.0, 0.0, 0.0],
+        channels=[2**i for i in range(5, 10)],
+        encoder_num_conv=[1] * 4,
+        decoder_num_conv=[0] * 4,
+        encoder_expand_rate=[4] * 4,
+        decoder_expand_rate=[4] * 4,
+        strides=[(2, 2, 2), (2, 2, 2), (2, 2, 2), (1, 1, 1)],
+        dropout_rate_list=[0.025, 0.05, 0.1, 0.1],
+        drop_path_rate_list=[0.025, 0.05, 0.1, 0.1],
         deep_supervision=True,
-        predict_mode=True,
+        predict_mode=False,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -438,15 +337,13 @@ class BresstCancerNet(nn.Module):
         self.depth = depth
         self.deep_supervision = deep_supervision
         self.predict_mode = predict_mode
+
         assert len(channels) == depth + 1, "len(encoder_channels) != depth + 1"
         assert len(strides) == depth, "len(strides) != depth"
 
         self.encoders = nn.ModuleList()  # 使用 ModuleList 存储编码器层
-        self.encoders.append(nn.Conv3d(in_channels, channels[0], 3, 1, 1))
         self.decoders = nn.ModuleList()  # 使用 ModuleList 存储解码器层
-
-        # self.positive_feature = nn.Parameter(torch.zeros(1, channels[0], 1, 1, 1))
-        # self.negative_feature = nn.Parameter(torch.zeros(1, channels[0], 1, 1, 1))
+        self.encoders.append(DenseConv(in_channels, channels[0]))
 
         # 创建编码器层
         for i in range(self.depth):
@@ -458,8 +355,9 @@ class BresstCancerNet(nn.Module):
                     num_conv=encoder_num_conv[i],
                     stride=strides[i],
                     expand_rate=encoder_expand_rate[i],
+                    dropout_rate=dropout_rate_list[i],
                     drop_path_rate=drop_path_rate_list[i],
-                )
+                ),
             )
 
         # 创建解码器层
@@ -474,7 +372,8 @@ class BresstCancerNet(nn.Module):
                     stride=strides[self.depth - i - 1],
                     fusion_mode="add",
                     expand_rate=decoder_expand_rate[self.depth - i - 1],
-                    drop_path_rate=0.0,
+                    dropout_rate=dropout_rate_list[self.depth - i - 1],
+                    drop_path_rate=drop_path_rate_list[self.depth - i - 1],
                 )
             )
         self.out = nn.ModuleList(
@@ -487,6 +386,7 @@ class BresstCancerNet(nn.Module):
 
         # 编码过程
         for encoder in self.encoders:
+            # print(encoder)
             x = encoder(x)
             encoder_features.append(x)
 
@@ -495,14 +395,6 @@ class BresstCancerNet(nn.Module):
         for i, decoder in enumerate(self.decoders):
             x_dec = decoder(x_dec, encoder_features[-(i + 2)])
             decoder_features.append(x_dec)  # 保存解码器特征
-
-        # positive_confidence = F.cosine_similarity(
-        #     self.positive_feature.expand_as(x_dec), x_dec, dim=1
-        # )
-        # negative_confidence = F.cosine_similarity(
-        #     self.negative_feature.expand_as(x_dec), x_dec, dim=1
-        # )
-        # confidence = torch.stack([positive_confidence, negative_confidence], dim=1)
 
         if self.deep_supervision:
             return [m(mask) for m, mask in zip(self.out, decoder_features)][::-1]
@@ -514,4 +406,7 @@ class BresstCancerNet(nn.Module):
 
 if __name__ == "__main__":
     model = BresstCancerNet(1, 4)
-    summary(model, input_size=(2, 1, 48, 192, 192), device="cuda:5", depth=5)
+    x = torch.randn(2, 1, 128, 128, 128)
+    y = model(x)
+    # print(y[0].shape)
+    summary(model, input_size=(2, 1, 128, 128, 128), device="cuda:4", depth=5)
